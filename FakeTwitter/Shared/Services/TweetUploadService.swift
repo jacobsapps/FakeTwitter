@@ -1,12 +1,24 @@
 import Foundation
 
 enum RetryStrategy: String, CaseIterable, Identifiable {
-    case exponentialBackoff = "Backoff"
-    case cappedRetries = "Capped"
-    case manualRetry = "Manual"
-    case idempotencyKey = "Idempotent"
+    case automatic = "Automatic"
+    case manual = "Manual"
 
     var id: String { rawValue }
+
+    var level2Label: String {
+        switch self {
+        case .automatic:
+            return "Exponential back-off"
+        case .manual:
+            return "User requested"
+        }
+    }
+}
+
+struct RetryOptions {
+    var capRetries: Bool = false
+    var useIdempotencyKey: Bool = false
 }
 
 struct TweetTimelineConfiguration {
@@ -44,6 +56,7 @@ protocol TweetUploadService: AnyObject {
         text: String,
         videoURL: URL?,
         strategy: RetryStrategy,
+        retryOptions: RetryOptions,
         progress: @escaping @MainActor (Double) -> Void
     ) async throws
     func statusSummary() async -> String?

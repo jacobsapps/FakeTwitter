@@ -23,6 +23,8 @@ Server URL: `http://localhost:8080`
 
 ## Endpoint behavior by level
 
+- Global network latency simulation: every request has ~100ms base delay.
+
 - `POST /level1/tweets`
   - Simulates occasional failure (~30%)
 - `POST /level2/tweets`

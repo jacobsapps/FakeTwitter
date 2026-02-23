@@ -6,7 +6,7 @@ import Foundation
 /// If the app is suspended between chunks, continuation waits until the app is active again.
 final class ResumableBackgroundUploadService: TweetUploadService {
     let configuration = TweetTimelineConfiguration(
-        title: "Level 3 · Resumable + Background",
+        title: "Resumable + Background",
         levelTag: "level3",
         supportsVideo: true,
         showsRetrySelector: false
@@ -30,13 +30,14 @@ final class ResumableBackgroundUploadService: TweetUploadService {
     }
 
     func fetchTweets() async -> [Tweet] {
-        await fetchTweets(client: client)
+        await loadTimelineTweets(client: client)
     }
 
     func postTweet(
         text: String,
         videoURL: URL?,
-        strategy: RetryStrategy,
+        strategy _: RetryStrategy,
+        retryOptions _: RetryOptions,
         progress: @escaping @MainActor (Double) -> Void
     ) async throws {
         guard let videoURL else {

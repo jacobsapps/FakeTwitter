@@ -4,7 +4,7 @@ import Foundation
 /// Level 1: single-attempt fire-and-forget upload.
 final class FireAndForgetUploadService: TweetUploadService {
     let configuration = TweetTimelineConfiguration(
-        title: "Level 1 · Fire and Forget",
+        title: "Fire and Forget",
         levelTag: "level1",
         supportsVideo: false,
         showsRetrySelector: false
@@ -17,13 +17,14 @@ final class FireAndForgetUploadService: TweetUploadService {
     }
 
     func fetchTweets() async -> [Tweet] {
-        await fetchTweets(client: client)
+        await loadTimelineTweets(client: client)
     }
 
     func postTweet(
         text: String,
         videoURL _: URL?,
         strategy _: RetryStrategy,
+        retryOptions _: RetryOptions,
         progress: @escaping @MainActor (Double) -> Void
     ) async throws {
         progress(0.1)

@@ -21,7 +21,9 @@ final class TweetTimelineViewModel: ObservableObject {
     @Published var composerText: String = ""
     @Published var isLoadingFeed = false
     @Published var isPosting = false
-    @Published var selectedRetryStrategy: RetryStrategy = .exponentialBackoff
+    @Published var selectedRetryStrategy: RetryStrategy = .automatic
+    @Published var capRetriesEnabled = false
+    @Published var useIdempotencyKeyEnabled = false
     @Published var selectedVideoURL: URL?
     @Published var selectedVideoLabel = "No video selected"
     @Published var uploadProgress: Double = 0
@@ -81,6 +83,10 @@ final class TweetTimelineViewModel: ObservableObject {
                 text: text,
                 videoURL: videoURL,
                 strategy: selectedRetryStrategy,
+                retryOptions: RetryOptions(
+                    capRetries: capRetriesEnabled,
+                    useIdempotencyKey: useIdempotencyKeyEnabled
+                ),
                 progress: { [weak self] value in
                     self?.uploadProgress = value
                     self?.showUploadProgress = true
@@ -88,9 +94,6 @@ final class TweetTimelineViewModel: ObservableObject {
             )
             pendingManualRetry = nil
             composerText = ""
-            if configuration.supportsVideo {
-                clearVideo()
-            }
             print("✅ \(configuration.levelTag) post flow finished")
         } catch let error as TweetUploadError {
             handle(error: error, text: text, videoURL: videoURL)

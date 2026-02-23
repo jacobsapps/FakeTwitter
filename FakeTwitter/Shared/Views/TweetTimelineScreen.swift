@@ -1,11 +1,11 @@
 import SwiftUI
-import PhotosUI
-import CoreTransferable
-import UniformTypeIdentifiers
+import AVKit
 
 struct TweetTimelineScreen: View {
     @StateObject private var viewModel: TweetTimelineViewModel
-    @State private var selectedVideoItem: PhotosPickerItem?
+    @State private var bundledVideoPlayer: AVPlayer?
+
+    private let bundledVideoDisplayName = "never_gonna_give_you_up.mp4"
 
     init(service: any TweetUploadService) {
         _viewModel = StateObject(wrappedValue: TweetTimelineViewModel(service: service))
@@ -51,23 +51,14 @@ struct TweetTimelineScreen: View {
                 .padding(.top, 12)
             }
             .navigationTitle(viewModel.configuration.title)
+            .navigationBarTitleDisplayMode(.inline)
             .refreshable {
                 await viewModel.loadTimeline()
             }
         }
         .task {
             await viewModel.loadTimeline()
-        }
-        .onChange(of: selectedVideoItem) { _, newItem in
-            guard let newItem else { return }
-            Task {
-                if let pickedMovie = try? await newItem.loadTransferable(type: PickedMovie.self) {
-                    viewModel.setSelectedVideo(url: pickedMovie.url)
-                    print("🎬 Picked video: \(pickedMovie.url.lastPathComponent)")
-                } else {
-                    viewModel.alert = .error(id: UUID(), message: "Failed to import selected video.")
-                }
-            }
+            configureBundledVideoIfNeeded()
         }
         .alert(item: $viewModel.alert) { alert in
             switch alert {
@@ -104,33 +95,21 @@ struct TweetTimelineScreen: View {
             if viewModel.configuration.showsRetrySelector {
                 Picker("Retry mode", selection: $viewModel.selectedRetryStrategy) {
                     ForEach(RetryStrategy.allCases) { strategy in
-                        Text(strategy.rawValue).tag(strategy)
+                        Text(levelRetryLabel(for: strategy)).tag(strategy)
                     }
                 }
                 .pickerStyle(.segmented)
+
+                Toggle("Cap retries", isOn: $viewModel.capRetriesEnabled)
+                    .font(.subheadline)
+                    .disabled(viewModel.selectedRetryStrategy == .manual)
+
+                Toggle("Use idempotency key", isOn: $viewModel.useIdempotencyKeyEnabled)
+                    .font(.subheadline)
             }
 
             if viewModel.configuration.supportsVideo {
-                VStack(alignment: .leading, spacing: 8) {
-                    PhotosPicker(selection: $selectedVideoItem, matching: .videos, photoLibrary: .shared()) {
-                        Label("Choose Video", systemImage: "video.badge.plus")
-                    }
-                    .buttonStyle(.bordered)
-
-                    HStack {
-                        Text(viewModel.selectedVideoLabel)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        if viewModel.selectedVideoURL != nil {
-                            Button("Clear") {
-                                viewModel.clearVideo()
-                                selectedVideoItem = nil
-                            }
-                            .font(.caption)
-                        }
-                    }
-                }
+                bundledVideoSection
             }
 
             HStack(spacing: 12) {
@@ -164,6 +143,50 @@ struct TweetTimelineScreen: View {
         )
         .padding(.horizontal)
     }
+
+    private var bundledVideoSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Video selected")
+                .font(.subheadline.weight(.semibold))
+
+            Text(bundledVideoDisplayName)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if let bundledVideoPlayer {
+                VideoPlayer(player: bundledVideoPlayer)
+                    .frame(width: 300)
+                    .aspectRatio(16 / 9, contentMode: .fill)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func levelRetryLabel(for strategy: RetryStrategy) -> String {
+        if viewModel.configuration.levelTag == "level2" {
+            return strategy.level2Label
+        }
+        return strategy.rawValue
+    }
+
+    private func configureBundledVideoIfNeeded() {
+        guard viewModel.configuration.supportsVideo else { return }
+
+        guard let videoURL = Bundle.main.url(
+            forResource: "never_gonna_give_you_up",
+            withExtension: "mp4"
+        ) else {
+            viewModel.alert = .error(id: UUID(), message: "Bundled video missing: \(bundledVideoDisplayName)")
+            return
+        }
+
+        viewModel.setSelectedVideo(url: videoURL)
+
+        if bundledVideoPlayer == nil {
+            bundledVideoPlayer = AVPlayer(url: videoURL)
+        }
+    }
 }
 
 private struct TweetRow: View {
@@ -191,19 +214,5 @@ private struct TweetRow: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(.secondarySystemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 14))
-    }
-}
-
-private struct PickedMovie: Transferable {
-    let url: URL
-
-    static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(importedContentType: .movie) { received in
-            let destination = FileManager.default.temporaryDirectory
-                .appendingPathComponent(UUID().uuidString)
-                .appendingPathExtension(received.file.pathExtension)
-            try FileManager.default.copyItem(at: received.file, to: destination)
-            return PickedMovie(url: destination)
-        }
     }
 }

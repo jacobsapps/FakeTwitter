@@ -1,6 +1,6 @@
 import Foundation
 
-func fetchTweets(client: HTTPClient) async -> [Tweet] {
+func loadTimelineTweets(client: HTTPClient) async -> [Tweet] {
     do {
         let response: TweetsResponse = try await client.getJSON(path: "/tweets")
         return response.tweets

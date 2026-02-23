@@ -36,7 +36,7 @@ If testing on a physical device, update `FakeTwitter/FakeTwitter/Shared/Config/A
 ## Level behavior
 
 - **Level 1**: one-shot fire-and-forget upload.
-- **Level 2**: retry strategies selectable in segmented control.
+- **Level 2**: `Automatic` vs `Manual` mode with optional toggles for retry caps and idempotency key.
 - **Level 3**: resumable video upload with persisted offset + background URLSession chunk uploads.
   - In this sample, each chunk can continue in the background, but scheduling the next chunk happens when app code runs again.
 - **Level 4**: durable SwiftData queue and state machine (`pending/uploading/failed/succeeded`) retried on launch.

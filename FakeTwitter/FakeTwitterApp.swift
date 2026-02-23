@@ -31,11 +31,12 @@ struct FakeTwitterApp: App {
         level2Service = RetryDisciplineUploadService(client: client)
         level3Service = ResumableBackgroundUploadService(client: client)
 
-        level4Engine = UploadJobEngine(container: modelContainer, client: client)
-        level4Service = DurableUploadService(client: client, engine: level4Engine)
+        let engine = UploadJobEngine(container: modelContainer, client: client)
+        level4Engine = engine
+        level4Service = DurableUploadService(client: client, engine: engine)
 
         Task {
-            await level4Engine.recoverAndProcessOutstandingJobs()
+            await engine.recoverAndProcessOutstandingJobs()
         }
     }
 

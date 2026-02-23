@@ -9,7 +9,7 @@ private enum Level2RetryFailure: Error {
 /// Demonstrates foreground retry discipline with selectable retry strategies.
 final class RetryDisciplineUploadService: TweetUploadService {
     let configuration = TweetTimelineConfiguration(
-        title: "Level 2 · Retry Discipline",
+        title: "Retry Discipline",
         levelTag: "level2",
         supportsVideo: false,
         showsRetrySelector: true
@@ -24,38 +24,45 @@ final class RetryDisciplineUploadService: TweetUploadService {
     }
 
     func fetchTweets() async -> [Tweet] {
-        await fetchTweets(client: client)
+        await loadTimelineTweets(client: client)
     }
 
     func postTweet(
         text: String,
         videoURL _: URL?,
         strategy: RetryStrategy,
+        retryOptions: RetryOptions,
         progress: @escaping @MainActor (Double) -> Void
     ) async throws {
+        let idempotencyKey = retryOptions.useIdempotencyKey ? UUID().uuidString : nil
+        if let idempotencyKey {
+            print("🧾 Level 2 idempotency key enabled: \(idempotencyKey)")
+        }
+
         switch strategy {
-        case .exponentialBackoff:
-            try await runExponentialBackoff(text: text, progress: progress)
-        case .cappedRetries:
-            try await runCappedCircuitMode(text: text, progress: progress)
-        case .manualRetry:
-            try await runManualRetryMode(text: text, progress: progress)
-        case .idempotencyKey:
-            try await runIdempotencyMode(text: text, progress: progress)
+        case .automatic:
+            if retryOptions.capRetries {
+                try await runCappedCircuitMode(text: text, idempotencyKey: idempotencyKey, progress: progress)
+            } else {
+                try await runExponentialBackoff(text: text, idempotencyKey: idempotencyKey, progress: progress)
+            }
+        case .manual:
+            try await runManualRetryMode(text: text, idempotencyKey: idempotencyKey, progress: progress)
         }
     }
 
     private func runExponentialBackoff(
         text: String,
+        idempotencyKey: String?,
         progress: @escaping @MainActor (Double) -> Void
     ) async throws {
         let maxAttempts = 5
         for attempt in 1...maxAttempts {
             progress(Double(attempt - 1) / Double(maxAttempts))
             do {
-                try await performOneAttempt(text: text, idempotencyKey: nil)
+                try await performOneAttempt(text: text, idempotencyKey: idempotencyKey)
                 progress(1.0)
-                print("🔁 Level 2 backoff succeeded on attempt \(attempt)")
+                print("🔁 Level 2 automatic backoff succeeded on attempt \(attempt)")
                 return
             } catch Level2RetryFailure.transient(let message, let retryAfter) {
                 print("⚠️ Transient failure attempt \(attempt): \(message)")
@@ -72,6 +79,7 @@ final class RetryDisciplineUploadService: TweetUploadService {
 
     private func runCappedCircuitMode(
         text: String,
+        idempotencyKey: String?,
         progress: @escaping @MainActor (Double) -> Void
     ) async throws {
         if let circuitOpenUntil, circuitOpenUntil > Date() {
@@ -83,10 +91,10 @@ final class RetryDisciplineUploadService: TweetUploadService {
         for attempt in 1...maxAttempts {
             progress(Double(attempt - 1) / Double(maxAttempts))
             do {
-                try await performOneAttempt(text: text, idempotencyKey: nil)
+                try await performOneAttempt(text: text, idempotencyKey: idempotencyKey)
                 consecutiveCappedFailures = 0
                 progress(1.0)
-                print("🛡️ Level 2 capped strategy succeeded")
+                print("🛡️ Level 2 capped automatic strategy succeeded")
                 return
             } catch Level2RetryFailure.transient(let message, _) {
                 print("🚧 Capped attempt \(attempt) failed: \(message)")
@@ -109,41 +117,16 @@ final class RetryDisciplineUploadService: TweetUploadService {
 
     private func runManualRetryMode(
         text: String,
+        idempotencyKey: String?,
         progress: @escaping @MainActor (Double) -> Void
     ) async throws {
         progress(0.1)
         do {
-            try await performOneAttempt(text: text, idempotencyKey: nil)
+            try await performOneAttempt(text: text, idempotencyKey: idempotencyKey)
             progress(1.0)
-            print("🙋 Manual strategy succeeded on first try")
+            print("🙋 Level 2 manual strategy succeeded on first try")
         } catch {
             throw TweetUploadError.manualRetrySuggested("Upload failed. Retry manually?")
-        }
-    }
-
-    private func runIdempotencyMode(
-        text: String,
-        progress: @escaping @MainActor (Double) -> Void
-    ) async throws {
-        let key = UUID().uuidString
-        let maxAttempts = 4
-
-        for attempt in 1...maxAttempts {
-            progress(Double(attempt - 1) / Double(maxAttempts))
-            do {
-                try await performOneAttempt(text: text, idempotencyKey: key)
-                progress(1.0)
-                print("🧾 Idempotent retry flow succeeded with key \(key)")
-                return
-            } catch Level2RetryFailure.transient(let message, _) {
-                print("♻️ Idempotent attempt \(attempt) failed: \(message)")
-                guard attempt < maxAttempts else {
-                    throw TweetUploadError.uploadFailed("Idempotent retries exhausted after \(maxAttempts) attempts.")
-                }
-                try await sleep(seconds: Double(attempt))
-            } catch Level2RetryFailure.terminal(let message) {
-                throw TweetUploadError.uploadFailed(message)
-            }
         }
     }
 
