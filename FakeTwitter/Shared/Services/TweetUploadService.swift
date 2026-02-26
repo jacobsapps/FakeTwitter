@@ -66,4 +66,9 @@ extension TweetUploadService {
     func statusSummary() async -> String? {
         nil
     }
+
+    var onBackgroundUploadComplete: (() -> Void)? {
+        get { nil }
+        set {}
+    }
 }

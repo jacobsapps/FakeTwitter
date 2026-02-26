@@ -12,25 +12,45 @@ final class ResumableBackgroundUploadService: TweetUploadService {
         showsRetrySelector: false
     )
 
-    private let client: HTTPClient
+    private let baseURL: URL
+    private let session: URLSession
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
     private let backgroundCoordinator: BackgroundSessionCoordinator
     private let offsetStore: UploadOffsetStore
+
+    var onBackgroundUploadComplete: (() -> Void)? {
+        didSet { backgroundCoordinator.onBackgroundUploadsFinished = onBackgroundUploadComplete }
+    }
 
     private let chunkSize: Int64 = 512 * 1024
     private let maxChunkRetries = 5
 
     init(
-        client: HTTPClient,
+        baseURL: URL,
+        session: URLSession = .shared,
         backgroundCoordinator: BackgroundSessionCoordinator? = nil,
         offsetStore: UploadOffsetStore? = nil
     ) {
-        self.client = client
+        self.baseURL = baseURL
+        self.session = session
         self.backgroundCoordinator = backgroundCoordinator ?? .shared
         self.offsetStore = offsetStore ?? UploadOffsetStore()
+        decoder.dateDecodingStrategy = .iso8601
     }
 
     func fetchTweets() async -> [Tweet] {
-        await loadTimelineTweets(client: client)
+        do {
+            let request = makeRequest(path: "tweets", method: "GET")
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return []
+            }
+            return try decoder.decode(TweetsEnvelope.self, from: data).tweets
+        } catch {
+            print("⚠️ Failed to fetch tweets: \(error.localizedDescription)")
+            return []
+        }
     }
 
     func postTweet(
@@ -49,13 +69,11 @@ final class ResumableBackgroundUploadService: TweetUploadService {
             throw TweetUploadError.validation("Selected video is empty.")
         }
 
-        let startRequest = Level3StartRequest(
+        let startResponse = try await startUploadSession(
             text: text,
             filename: videoURL.lastPathComponent,
             totalBytes: fileSize
         )
-
-        let startResponse: Level3StartResponse = try await client.postJSON(path: "/level3/uploads/start", payload: startRequest)
 
         var offset = max(startResponse.nextOffset, await offsetStore.offset(for: startResponse.sessionId))
         progress(Double(offset) / Double(fileSize))
@@ -65,7 +83,6 @@ final class ResumableBackgroundUploadService: TweetUploadService {
         while offset < fileSize {
             let remaining = fileSize - offset
             let currentChunkSize = min(chunkSize, remaining)
-            var uploadedThisChunk = false
 
             for attempt in 1...maxChunkRetries {
                 do {
@@ -78,11 +95,11 @@ final class ResumableBackgroundUploadService: TweetUploadService {
                         throw TweetUploadError.uploadFailed("Failed to read chunk bytes from selected video.")
                     }
 
-                    var request = URLRequest(url: client.url(path: "/level3/uploads/\(startResponse.sessionId)/chunk"))
-                    request.httpMethod = "PUT"
-                    request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-                    request.setValue("\(offset)", forHTTPHeaderField: "Upload-Offset")
-                    request.setValue("\(fileSize)", forHTTPHeaderField: "Upload-Length")
+                    let request = makeChunkRequest(
+                        sessionId: startResponse.sessionId,
+                        offset: offset,
+                        totalBytes: fileSize
+                    )
 
                     let baseOffset = offset
                     let response = try await backgroundCoordinator.uploadChunk(request: request, fromFile: chunkFile.url) { chunkProgress in
@@ -90,12 +107,13 @@ final class ResumableBackgroundUploadService: TweetUploadService {
                         progress(min(0.99, overall))
                     }
 
-                    let nextOffsetHeader = response.value(forHTTPHeaderField: "Upload-Offset")
-                    let nextOffset = Int64(nextOffsetHeader ?? "") ?? (offset + chunkFile.byteCount)
+                    let nextOffset = parseNextOffset(
+                        from: response,
+                        fallbackOffset: offset + chunkFile.byteCount
+                    )
                     offset = max(nextOffset, offset + chunkFile.byteCount)
                     await offsetStore.set(offset: offset, for: startResponse.sessionId)
 
-                    uploadedThisChunk = true
                     print("📦 Chunk uploaded. offset=\(offset)/\(fileSize)")
                     break
                 } catch {
@@ -108,19 +126,12 @@ final class ResumableBackgroundUploadService: TweetUploadService {
                     let remoteOffset = try await fetchRemoteOffset(sessionId: startResponse.sessionId)
                     offset = max(offset, remoteOffset)
                     await offsetStore.set(offset: offset, for: startResponse.sessionId)
-                    try await sleep(seconds: Double(attempt))
+                    try await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000)
                 }
-            }
-
-            if !uploadedThisChunk {
-                throw TweetUploadError.uploadFailed("Resumable upload failed after \(maxChunkRetries) retries for one chunk.")
             }
         }
 
-        _ = try await client.postJSONWithoutResponse(
-            path: "/level3/uploads/\(startResponse.sessionId)/complete",
-            payload: PostTweetRequest(text: text)
-        )
+        try await completeUpload(sessionId: startResponse.sessionId, text: text)
 
         await offsetStore.clear(sessionId: startResponse.sessionId)
         progress(1.0)
@@ -128,8 +139,49 @@ final class ResumableBackgroundUploadService: TweetUploadService {
     }
 
     private func fetchRemoteOffset(sessionId: String) async throws -> Int64 {
-        let status: Level3StatusResponse = try await client.getJSON(path: "/level3/uploads/\(sessionId)")
+        let request = makeRequest(path: "level3/uploads/\(sessionId)", method: "GET")
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw TweetUploadError.uploadFailed("Invalid server response while checking upload offset.")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let bodyText = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            throw TweetUploadError.uploadFailed("Request failed with HTTP \(http.statusCode). \(bodyText)")
+        }
+        let status = try decoder.decode(Level3StatusBody.self, from: data)
         return status.offset
+    }
+
+    /// Snippet-friendly start endpoint for resumable uploads.
+    private func startUploadSession(text: String, filename: String, totalBytes: Int64) async throws -> Level3StartBody {
+        var request = makeRequest(path: "level3/uploads/start", method: "POST")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encoder.encode(Level3StartRequestBody(text: text, filename: filename, totalBytes: totalBytes))
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw TweetUploadError.uploadFailed("Invalid server response while starting upload.")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let bodyText = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            throw TweetUploadError.uploadFailed("Request failed with HTTP \(http.statusCode). \(bodyText)")
+        }
+        return try decoder.decode(Level3StartBody.self, from: data)
+    }
+
+    private func completeUpload(sessionId: String, text: String) async throws {
+        var request = makeRequest(path: "level3/uploads/\(sessionId)/complete", method: "POST")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encoder.encode(Level3CompleteBody(text: text))
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw TweetUploadError.uploadFailed("Invalid server response while finalizing upload.")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let bodyText = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            throw TweetUploadError.uploadFailed("Request failed with HTTP \(http.statusCode). \(bodyText)")
+        }
     }
 
     private func fileByteSize(for fileURL: URL) throws -> Int64 {
@@ -152,7 +204,54 @@ final class ResumableBackgroundUploadService: TweetUploadService {
         return (url: chunkURL, byteCount: Int64(data.count))
     }
 
-    private func sleep(seconds: TimeInterval) async throws {
-        try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+    /// Snippet-friendly chunk request for resumable uploads.
+private func makeChunkRequest(sessionId: String, offset: Int64, totalBytes: Int64) -> URLRequest {
+    var request = URLRequest(url: url("level3/uploads/\(sessionId)/chunk"))
+    request.httpMethod = "PUT"
+    request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+    request.setValue("\(offset)", forHTTPHeaderField: "Upload-Offset")
+    request.setValue("\(totalBytes)", forHTTPHeaderField: "Upload-Length")
+    return request
+}
+
+    private func parseNextOffset(from response: HTTPURLResponse, fallbackOffset: Int64) -> Int64 {
+        let headerValue = response.value(forHTTPHeaderField: "Upload-Offset")
+        return Int64(headerValue ?? "") ?? fallbackOffset
+    }
+
+    private func makeRequest(path: String, method: String) -> URLRequest {
+        var request = URLRequest(url: url(path))
+        request.httpMethod = method
+        return request
+    }
+
+    private func url(_ path: String) -> URL {
+        baseURL.appending(path: path)
+    }
+
+    private struct TweetsEnvelope: Codable {
+        let tweets: [Tweet]
+    }
+
+    private struct Level3StartRequestBody: Codable {
+        let text: String
+        let filename: String
+        let totalBytes: Int64
+    }
+
+    private struct Level3StartBody: Codable {
+        let sessionId: String
+        let nextOffset: Int64
+    }
+
+    private struct Level3StatusBody: Codable {
+        let sessionId: String
+        let offset: Int64
+        let totalBytes: Int64
+        let complete: Bool
+    }
+
+    private struct Level3CompleteBody: Codable {
+        let text: String
     }
 }

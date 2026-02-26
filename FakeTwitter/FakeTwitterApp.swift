@@ -26,14 +26,14 @@ struct FakeTwitterApp: App {
         // Eagerly create the background session so it can receive system wake callbacks.
         _ = BackgroundSessionCoordinator.shared
 
-        let client = HTTPClient(baseURL: AppEnvironment.serverBaseURL)
-        level1Service = FireAndForgetUploadService(client: client)
-        level2Service = RetryDisciplineUploadService(client: client)
-        level3Service = ResumableBackgroundUploadService(client: client)
+        let baseURL = AppEnvironment.serverBaseURL
+        level1Service = FireAndForgetUploadService(baseURL: baseURL)
+        level2Service = RetryDisciplineUploadService(baseURL: baseURL)
+        level3Service = ResumableBackgroundUploadService(baseURL: baseURL)
 
-        let engine = UploadJobEngine(container: modelContainer, client: client)
+        let engine = UploadJobEngine(container: modelContainer, baseURL: baseURL)
         level4Engine = engine
-        level4Service = DurableUploadService(client: client, engine: engine)
+        level4Service = DurableUploadService(engine: engine, baseURL: baseURL)
 
         Task {
             await engine.recoverAndProcessOutstandingJobs()

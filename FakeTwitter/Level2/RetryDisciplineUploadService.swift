@@ -15,16 +15,31 @@ final class RetryDisciplineUploadService: TweetUploadService {
         showsRetrySelector: true
     )
 
-    private let client: HTTPClient
+    private let baseURL: URL
+    private let session: URLSession
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
     private var consecutiveCappedFailures = 0
     private var circuitOpenUntil: Date?
 
-    init(client: HTTPClient) {
-        self.client = client
+    init(baseURL: URL, session: URLSession = .shared) {
+        self.baseURL = baseURL
+        self.session = session
+        decoder.dateDecodingStrategy = .iso8601
     }
 
     func fetchTweets() async -> [Tweet] {
-        await loadTimelineTweets(client: client)
+        do {
+            let request = makeRequest(path: "tweets", method: "GET")
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return []
+            }
+            return try decoder.decode(TweetsEnvelope.self, from: data).tweets
+        } catch {
+            print("⚠️ Failed to fetch tweets: \(error.localizedDescription)")
+            return []
+        }
     }
 
     func postTweet(
@@ -34,10 +49,7 @@ final class RetryDisciplineUploadService: TweetUploadService {
         retryOptions: RetryOptions,
         progress: @escaping @MainActor (Double) -> Void
     ) async throws {
-        let idempotencyKey = retryOptions.useIdempotencyKey ? UUID().uuidString : nil
-        if let idempotencyKey {
-            print("🧾 Level 2 idempotency key enabled: \(idempotencyKey)")
-        }
+        let idempotencyKey = makeIdempotencyKey(enabled: retryOptions.useIdempotencyKey)
 
         switch strategy {
         case .automatic:
@@ -57,22 +69,61 @@ final class RetryDisciplineUploadService: TweetUploadService {
         progress: @escaping @MainActor (Double) -> Void
     ) async throws {
         let maxAttempts = 5
+
         for attempt in 1...maxAttempts {
             progress(Double(attempt - 1) / Double(maxAttempts))
             do {
-                try await performOneAttempt(text: text, idempotencyKey: idempotencyKey)
-                progress(1.0)
-                print("🔁 Level 2 automatic backoff succeeded on attempt \(attempt)")
-                return
+                var request = makeRequest(path: "level2/tweets", method: "POST")
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                if let idempotencyKey {
+                    request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+                }
+                request.httpBody = try encoder.encode(Level2PostBody(text: text))
+
+                let (data, response) = try await session.data(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    throw Level2RetryFailure.transient(message: "Invalid response.", retryAfter: nil)
+                }
+
+                if (200...299).contains(http.statusCode) {
+                    progress(1.0)
+                    print("🔁 Level 2 automatic backoff succeeded on attempt \(attempt)")
+                    return
+                }
+
+                let bodyText = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+
+                if http.statusCode >= 500 || http.statusCode == 429 {
+                    throw Level2RetryFailure.transient(
+                        message: bodyText.isEmpty ? "Server unavailable." : bodyText,
+                        retryAfter: retryAfter
+                    )
+                }
+
+                throw Level2RetryFailure.terminal(
+                    message: bodyText.isEmpty ? "Request failed with HTTP \(http.statusCode)." : bodyText
+                )
             } catch Level2RetryFailure.transient(let message, let retryAfter) {
                 print("⚠️ Transient failure attempt \(attempt): \(message)")
                 guard attempt < maxAttempts else {
                     throw TweetUploadError.uploadFailed("Backoff retries exhausted after \(maxAttempts) attempts.")
                 }
-                let delay = retryAfter ?? min(8.0, pow(2.0, Double(attempt - 1)))
-                try await sleep(seconds: delay)
+                let delay = exponentialBackoffDelay(attempt: attempt, serverRetryAfter: retryAfter)
+                try await Task.sleep(for: .seconds(delay))
             } catch Level2RetryFailure.terminal(let message) {
                 throw TweetUploadError.uploadFailed(message)
+            } catch {
+                if let urlError = error as? URLError,
+                   urlError.code == .notConnectedToInternet || urlError.code == .timedOut {
+                    guard attempt < maxAttempts else {
+                        throw TweetUploadError.uploadFailed("Backoff retries exhausted after \(maxAttempts) attempts.")
+                    }
+                    let delay = exponentialBackoffDelay(attempt: attempt, serverRetryAfter: nil)
+                    try await Task.sleep(for: .seconds(delay))
+                    continue
+                }
+                throw TweetUploadError.uploadFailed(error.localizedDescription)
             }
         }
     }
@@ -99,7 +150,7 @@ final class RetryDisciplineUploadService: TweetUploadService {
             } catch Level2RetryFailure.transient(let message, _) {
                 print("🚧 Capped attempt \(attempt) failed: \(message)")
                 guard attempt < maxAttempts else { break }
-                try await sleep(seconds: 0.75)
+                try await Task.sleep(for: .seconds(0.75))
             } catch Level2RetryFailure.terminal(let message) {
                 throw TweetUploadError.uploadFailed(message)
             }
@@ -131,26 +182,22 @@ final class RetryDisciplineUploadService: TweetUploadService {
     }
 
     private func performOneAttempt(text: String, idempotencyKey: String?) async throws {
-        var headers: [String: String] = [:]
-        if let idempotencyKey {
-            headers["Idempotency-Key"] = idempotencyKey
-        }
-
         do {
-            let (data, http) = try await client.postJSONRaw(
-                path: "/level2/tweets",
-                payload: PostTweetRequest(text: text),
-                headers: headers
-            )
+            let request = try makePostRequest(text: text, idempotencyKey: idempotencyKey)
+            let (data, response) = try await session.data(for: request)
+
+            guard let http = response as? HTTPURLResponse else {
+                throw Level2RetryFailure.transient(message: "Invalid response.", retryAfter: nil)
+            }
 
             if (200...299).contains(http.statusCode) {
                 return
             }
 
-            let bodyText = String(data: data, encoding: .utf8) ?? ""
-            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+            let bodyText = responseBodyText(data)
+            let retryAfter = retryAfterSeconds(from: http)
 
-            if http.statusCode >= 500 || http.statusCode == 429 {
+            if isTransientHTTPStatus(http.statusCode) {
                 throw Level2RetryFailure.transient(
                     message: bodyText.isEmpty ? "Server unavailable." : bodyText,
                     retryAfter: retryAfter
@@ -163,16 +210,69 @@ final class RetryDisciplineUploadService: TweetUploadService {
         } catch let error as Level2RetryFailure {
             throw error
         } catch {
-            if let urlError = error as? URLError,
-               urlError.code == .notConnectedToInternet || urlError.code == .timedOut {
-                throw Level2RetryFailure.transient(message: urlError.localizedDescription, retryAfter: nil)
+            if isTransientNetworkError(error) {
+                throw Level2RetryFailure.transient(message: error.localizedDescription, retryAfter: nil)
             }
             throw Level2RetryFailure.transient(message: error.localizedDescription, retryAfter: nil)
         }
     }
 
-    private func sleep(seconds: TimeInterval) async throws {
-        let nanoseconds = UInt64(max(0.05, seconds) * 1_000_000_000)
-        try await Task.sleep(nanoseconds: nanoseconds)
+    private func makeIdempotencyKey(enabled: Bool) -> String? {
+        guard enabled else { return nil }
+        let key = UUID().uuidString
+        print("🧾 Level 2 idempotency key enabled: \(key)")
+        return key
+    }
+
+    private func exponentialBackoffDelay(attempt: Int, serverRetryAfter: TimeInterval?) -> TimeInterval {
+        if let serverRetryAfter {
+            return serverRetryAfter
+        }
+        return pow(2.0, Double(attempt - 1))
+    }
+
+    private func makePostRequest(text: String, idempotencyKey: String?) throws -> URLRequest {
+        var request = makeRequest(path: "level2/tweets", method: "POST")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let idempotencyKey {
+            request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+        }
+        request.httpBody = try encoder.encode(Level2PostBody(text: text))
+        return request
+    }
+
+    private func retryAfterSeconds(from response: HTTPURLResponse) -> TimeInterval? {
+        response.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+    }
+
+    private func responseBodyText(_ data: Data) -> String {
+        String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private func isTransientHTTPStatus(_ statusCode: Int) -> Bool {
+        statusCode >= 500 || statusCode == 429
+    }
+
+    private func isTransientNetworkError(_ error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        return urlError.code == .notConnectedToInternet || urlError.code == .timedOut
+    }
+
+    private func makeRequest(path: String, method: String) -> URLRequest {
+        var request = URLRequest(url: url(path))
+        request.httpMethod = method
+        return request
+    }
+
+    private func url(_ path: String) -> URL {
+        baseURL.appending(path: path)
+    }
+
+    private struct Level2PostBody: Codable {
+        let text: String
+    }
+
+    private struct TweetsEnvelope: Codable {
+        let tweets: [Tweet]
     }
 }

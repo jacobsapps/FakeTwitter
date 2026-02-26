@@ -30,6 +30,7 @@ final class TweetTimelineViewModel: ObservableObject {
     @Published var showUploadProgress = false
     @Published var statusMessage: String?
     @Published var alert: ComposerAlert?
+    @Published var backgroundCompletionMessage: String?
 
     let configuration: TweetTimelineConfiguration
 
@@ -46,6 +47,11 @@ final class TweetTimelineViewModel: ObservableObject {
         tweets = await service.fetchTweets()
         statusMessage = await service.statusSummary()
         isLoadingFeed = false
+
+        service.onBackgroundUploadComplete = { [weak self] in
+            self?.backgroundCompletionMessage = "Background upload complete!"
+            Task { [weak self] in await self?.loadTimeline() }
+        }
     }
 
     func setSelectedVideo(url: URL) {

@@ -1,11 +1,4 @@
 import Foundation
 
-func loadTimelineTweets(client: HTTPClient) async -> [Tweet] {
-    do {
-        let response: TweetsResponse = try await client.getJSON(path: "/tweets")
-        return response.tweets
-    } catch {
-        print("⚠️ Failed to fetch tweets: \(error.localizedDescription)")
-        return []
-    }
-}
+// Legacy file intentionally kept lightweight.
+// Timeline fetch now lives directly in each level service for blog-snippet clarity.

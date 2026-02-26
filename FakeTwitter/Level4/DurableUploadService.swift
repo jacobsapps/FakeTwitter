@@ -10,16 +10,34 @@ final class DurableUploadService: TweetUploadService {
         showsRetrySelector: false
     )
 
-    private let client: HTTPClient
+    private let baseURL: URL
+    private let session: URLSession
+    private let decoder = JSONDecoder()
     private let engine: UploadJobEngine
 
-    init(client: HTTPClient, engine: UploadJobEngine) {
-        self.client = client
+    init(
+        engine: UploadJobEngine,
+        baseURL: URL,
+        session: URLSession = .shared
+    ) {
         self.engine = engine
+        self.baseURL = baseURL
+        self.session = session
+        decoder.dateDecodingStrategy = .iso8601
     }
 
     func fetchTweets() async -> [Tweet] {
-        await loadTimelineTweets(client: client)
+        do {
+            let request = makeRequest(path: "tweets", method: "GET")
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return []
+            }
+            return try decoder.decode(TweetsEnvelope.self, from: data).tweets
+        } catch {
+            print("⚠️ Failed to fetch tweets: \(error.localizedDescription)")
+            return []
+        }
     }
 
     func postTweet(
@@ -37,5 +55,19 @@ final class DurableUploadService: TweetUploadService {
     func statusSummary() async -> String? {
         let outstanding = await engine.outstandingCount()
         return "Durable queue outstanding jobs: \(outstanding)"
+    }
+
+    private func makeRequest(path: String, method: String) -> URLRequest {
+        var request = URLRequest(url: url(path))
+        request.httpMethod = method
+        return request
+    }
+
+    private func url(_ path: String) -> URL {
+        baseURL.appending(path: path)
+    }
+
+    private struct TweetsEnvelope: Codable {
+        let tweets: [Tweet]
     }
 }

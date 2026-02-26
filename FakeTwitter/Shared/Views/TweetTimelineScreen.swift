@@ -17,6 +17,14 @@ struct TweetTimelineScreen: View {
                 VStack(spacing: 16) {
                     composerCard
 
+                    if let backgroundMessage = viewModel.backgroundCompletionMessage {
+                        Text(backgroundMessage)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.green)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal)
+                    }
+
                     if let statusMessage = viewModel.statusMessage {
                         Text(statusMessage)
                             .font(.caption)
